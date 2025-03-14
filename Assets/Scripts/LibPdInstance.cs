@@ -458,12 +458,43 @@ public class LibPdInstance : MonoBehaviour
 	private static bool pdInitialised = false;
 	/// Global reference count used to determine when to un-initialise libpd.
 	private static int numInstances = 0;
-	#endregion
+    #endregion
+	// ADDED:
+	// this fixes the resetting of the pipePrintToConsoleStatic bug:
+	// resetting at runtime
+#if UNITY_EDITOR
+    [InitializeOnLoad]
+    private static class EditorInitializer
+    {
+        static EditorInitializer()
+        {
+            //EditorApplication.playModeStateChanged += OnPlayModeStateChanged;
+        }
 
-	#region events
-	//--------------------------------------------------------------------------
-	/// Events placed in a struct so they don't clutter up the Inspector by default.
-	[System.Serializable]
+        private static void OnPlayModeStateChanged(PlayModeStateChange state)
+        {
+            if (state == PlayModeStateChange.ExitingEditMode)
+            {
+                var instances = FindObjectsByType<LibPdInstance>(FindObjectsSortMode.None);
+                if (instances.Length > 0)
+                {
+                    pipePrintToConsoleStatic = instances[0].pipePrintToConsole;
+                    Debug.Log($"EditorInitializer: Set pipePrintToConsoleStatic to {pipePrintToConsoleStatic} from {instances[0].gameObject.name}");
+                }
+            }
+            /*else if (state == PlayModeStateChange.EnteredEditMode)
+            {
+                // Log to confirm state on stop
+                //Debug.Log("EditorInitializer EnteredEditMode: pipePrintToConsoleStatic = " + pipePrintToConsoleStatic);
+            }*/
+        }
+    }
+#endif
+
+    #region events
+    //--------------------------------------------------------------------------
+    /// Events placed in a struct so they don't clutter up the Inspector by default.
+    [System.Serializable]
 	public struct PureDataEvents
 	{
 		/// UnityEvent that will be invoked whenever we recieve a bang from the PD patch.
@@ -507,8 +538,15 @@ public class LibPdInstance : MonoBehaviour
 	/// Initialise LibPd.
 	void Awake()
 	{
-		//Initialise libpd if possible, report any errors.
-		int initErr = libpd_queued_init();
+		// ADDED 
+        // If this is the first instance and pdInitialised is false, sync the static variable
+        if (!pdInitialised)
+        {
+            pipePrintToConsoleStatic = pipePrintToConsole;
+            //Debug.Log($"{gameObject.name} Awake: Synced pipePrintToConsoleStatic to {pipePrintToConsoleStatic}");
+        }
+        //Initialise libpd if possible, report any errors.
+        int initErr = libpd_queued_init();
 		if (initErr != 0)
 		{
 			Debug.LogWarning("Warning; libpd_init() returned " + initErr);
@@ -570,8 +608,9 @@ public class LibPdInstance : MonoBehaviour
 			//correctly.
 			pipePrintToConsoleStatic = pipePrintToConsole;
 		}
-		else
-			pipePrintToConsole = pipePrintToConsoleStatic;
+		// DELETED
+		//else
+		//	pipePrintToConsole = pipePrintToConsoleStatic;
 
 		//Calc numTicks.
 		int bufferSize;
@@ -721,43 +760,43 @@ public class LibPdInstance : MonoBehaviour
 	/// updated too.
 	private void OnValidate()
 	{
-		if(pipePrintToConsoleStatic != pipePrintToConsole)
-		{
-			pipePrintToConsoleStatic = pipePrintToConsole;
+        // DELETED
+        //if(pipePrintToConsoleStatic != pipePrintToConsole)
+        //{
+        //	pipePrintToConsoleStatic = pipePrintToConsole;
 
-			LibPdInstance[] activePatches = FindObjectsOfType<LibPdInstance>();
+        //	LibPdInstance[] activePatches = FindObjectsOfType<LibPdInstance>();
 
-			for(int i=0;i<activePatches.Length;++i)
-				activePatches[i].pipePrintToConsole = pipePrintToConsoleStatic;
-		}
+        //	for(int i=0;i<activePatches.Length;++i)
+        //		activePatches[i].pipePrintToConsole = pipePrintToConsoleStatic;
+        //}
 
-		#if UNITY_EDITOR
-		string lastName = patchName;
+		// MODIFIED
+#if UNITY_EDITOR
+        if (!EditorApplication.isPlaying) // Only sync in Edit Mode
+        {
+            string lastName = patchName;
 
-		//We use this to store the name of our PD patch as a string, as we need
-		//to feed the filename and directory into libpd.
-		if(patch != null)
-			patchName = patch.name;
+            if (patch != null)
+                patchName = patch.name;
 
-		if((lastName != patchName) ||
-		   ((patch != null) && (patchDir == null)) ||
-		   ((patch != null) && (patchDir != null) && (patchDir.IndexOf("StreamingAssets") != -1))) //This is unfortunately necessary to upgrade the serialised data saved from versions of LibPdIntegration < v2.0.1.
-		{
-			patchDir = AssetDatabase.GetAssetPath(patch.GetInstanceID());
+            if ((lastName != patchName) ||
+                ((patch != null) && (patchDir == null)) ||
+                ((patch != null) && (patchDir != null) && (patchDir.IndexOf("StreamingAssets") != -1)))
+            {
+                patchDir = AssetDatabase.GetAssetPath(patch.GetInstanceID());
+                patchDir = patchDir.Substring(patchDir.IndexOf("Assets/StreamingAssets") + 22);
+                patchDir = patchDir.Substring(0, patchDir.LastIndexOf('/') + 1);
+            }
+        }
 
-			//Strip out "Assets/StreamingAssets", as the files won't be in the
-			//Assets folder in a built version, only when running in the editor.
-			patchDir = patchDir.Substring(patchDir.IndexOf("Assets/StreamingAssets") + 22);
+		
+#endif
+    }
 
-			//Remove the name of the patch, as we only need the directory.
-			patchDir = patchDir.Substring(0, patchDir.LastIndexOf('/') + 1);
-		}
-		#endif
-	}
-
-	//--------------------------------------------------------------------------
-	/// Process audio.
-	void OnAudioFilterRead(float[] data, int channels)
+    //--------------------------------------------------------------------------
+    /// Process audio.
+    void OnAudioFilterRead(float[] data, int channels)
 	{
 		if(!pdFail && !patchFail && loaded)
 		{
@@ -842,6 +881,9 @@ public class LibPdInstance : MonoBehaviour
 	[MethodImpl(MethodImplOptions.Synchronized)]
 	public void SendList(string receiver, params object[] args)
 	{
+		// ADDED:
+		// fixes the sendlist bug
+		libpd_set_instance(instance);
 		ProcessArgs(args);
 
 		if(libpd_finish_list(receiver) != 0)
@@ -859,6 +901,9 @@ public class LibPdInstance : MonoBehaviour
 							string symbol,
 							params object[] args)
 	{
+        // ADDED:
+        // fixes the sendMessage bug
+        libpd_set_instance(instance);
 		ProcessArgs(args);
 
 		if(libpd_finish_message(destination, symbol) != 0)
