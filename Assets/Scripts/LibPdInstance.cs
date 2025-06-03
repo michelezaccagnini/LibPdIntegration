@@ -29,6 +29,7 @@ using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using System.Runtime.CompilerServices;
 using AOT;
+using System.Diagnostics;
 
 #region UnityEvent types
 //------------------------------------------------------------------------------
@@ -90,8 +91,72 @@ public class IntIntEvent : UnityEvent<int, int> {}
 [RequireComponent(typeof(AudioSource))]
 public class LibPdInstance : MonoBehaviour
 {
+    #region member variables
+    //--------------------------------------------------------------------------
+    /// The Pd patch this instance is running.
+    [HideInInspector]
+    public string patchName;
+    ///	Path to the folder the patch is in.
+    [HideInInspector]
+    public string patchDir;
 
-	#region libpd imports
+    private PatchingUtils.IPatchBuilder patchBuilder;
+
+
+#if UNITY_EDITOR
+    /// This is a slightly tricky workaround we use so that we can drag and drop
+    /// PD patches into the Inspector. By default, Unity doesn't let you do that
+    /// with StreamingAssets, so we use the DefaultAsset type to get around that
+    /// limitation. It's not perfect, but it's nicer than the alternative
+    /// (typing the patch name by hand into a string box).
+    /// 
+    /// See also OnValidate().
+    ///	
+    ///	(We have to store Pd patches in StreamingAssets because libpd requires
+    ///	 us to load patches from files on the filesystem)
+    public UnityEditor.DefaultAsset patch;
+#endif
+
+    /// Hacky way of making pipePrintToConsoleStatic visible in the inspector.
+    public bool pipePrintToConsole = false;
+    /// Set to true to pipe any Pure Data *print* messages to Unity's console.
+    private static bool pipePrintToConsoleStatic = false;// Synced from first instance in Awake
+
+    /// Our pointer to the Pd patch this instance is running.
+    IntPtr patchPointer;
+
+    /// The Pd instance we're using.
+    private IntPtr instance;
+    /// The number of ticks to process at a time.
+    private int numTicks;
+
+    /// Any bindings we have for this patch.
+    private Dictionary<string, IntPtr> bindings;
+
+    ///	We use this to ensure libpd -> Unity events get sent to all LibPdInstances.
+    /*!
+		IMPORTANT: Bear in mind that C#'s List is not thread-safe. That's not a
+		problem for the way we're using it at the time of writing, because
+		activeInstances only gets accessed from the main thread in OnEnable,
+		OnDisable and the various BangOutput, FloatOutput, etc. delegates that
+		themselves get called from Update.
+
+		activeInstances should *NEVER* be accessed from the audio thread though.
+	 */
+    private static List<LibPdInstance> activeInstances = new List<LibPdInstance>();
+
+    /// True if we were unable to intialise Pd's audio processing.
+    private bool pdFail = false;
+    /// True if we were unable to open our patch.
+    private bool patchFail = false;
+    ///	True if we have successfully loaded our patch.
+    private bool loaded = false;
+
+    /// Global variable used to ensure we don't initialise libpd more than once.
+    private static bool pdInitialised = false;
+    /// Global reference count used to determine when to un-initialise libpd.
+    private static int numInstances = 0;
+    #region libpd imports
 
 #if UNITY_IOS
 	private const string DLL_NAME="__Internal";
@@ -101,7 +166,7 @@ public class LibPdInstance : MonoBehaviour
 //#elif UNITY_STANDALONE_WIN
 //	private const string DLL_NAME="pd";
 #else
-	private const string DLL_NAME="libpd";
+    private const string DLL_NAME="libpd";
 #endif
 	
 	
@@ -236,7 +301,8 @@ public class LibPdInstance : MonoBehaviour
 	[DllImport(DLL_NAME)]
 	private static extern int libpd_midibyte(int port, int value);
 
-	[DllImport(DLL_NAME)]
+
+    [DllImport(DLL_NAME)]
 	private static extern int libpd_sysex(int port, int value);
 
 	[DllImport(DLL_NAME)]
@@ -396,72 +462,9 @@ public class LibPdInstance : MonoBehaviour
 	private LibPdMidiByteHook midiByteHook;
 	#endregion
 
-	#region member variables
-	//--------------------------------------------------------------------------
-	/// The Pd patch this instance is running.
-	[HideInInspector]
-	public string patchName;
-	///	Path to the folder the patch is in.
-	[HideInInspector]
-	public string patchDir;
-
-	#if UNITY_EDITOR
-	/// This is a slightly tricky workaround we use so that we can drag and drop
-	/// PD patches into the Inspector. By default, Unity doesn't let you do that
-	/// with StreamingAssets, so we use the DefaultAsset type to get around that
-	/// limitation. It's not perfect, but it's nicer than the alternative
-	/// (typing the patch name by hand into a string box).
-	/// 
-	/// See also OnValidate().
-	///	
-	///	(We have to store Pd patches in StreamingAssets because libpd requires
-	///	 us to load patches from files on the filesystem)
-	public UnityEditor.DefaultAsset patch;
-	#endif
-
-	/// Hacky way of making pipePrintToConsoleStatic visible in the inspector.
-	public bool pipePrintToConsole = false;
-	/// Set to true to pipe any Pure Data *print* messages to Unity's console.
-	public static bool pipePrintToConsoleStatic = false;
-
-	/// Our pointer to the Pd patch this instance is running.
-	IntPtr patchPointer;
-
-	/// The Pd instance we're using.
-	private IntPtr instance;
-	/// The number of ticks to process at a time.
-	private int numTicks;
-
-	/// Any bindings we have for this patch.
-	private Dictionary<string, IntPtr> bindings;
-
-	///	We use this to ensure libpd -> Unity events get sent to all LibPdInstances.
-	/*!
-		IMPORTANT: Bear in mind that C#'s List is not thread-safe. That's not a
-		problem for the way we're using it at the time of writing, because
-		activeInstances only gets accessed from the main thread in OnEnable,
-		OnDisable and the various BangOutput, FloatOutput, etc. delegates that
-		themselves get called from Update.
-
-		activeInstances should *NEVER* be accessed from the audio thread though.
-	 */
-	private static List<LibPdInstance> activeInstances = new List<LibPdInstance>();
-
-	/// True if we were unable to intialise Pd's audio processing.
-	private bool pdFail = false;
-	/// True if we were unable to open our patch.
-	private bool patchFail = false;
-	///	True if we have successfully loaded our patch.
-	private bool loaded = false;
-
-	/// Global variable used to ensure we don't initialise libpd more than once.
-	private static bool pdInitialised = false;
-	/// Global reference count used to determine when to un-initialise libpd.
-	private static int numInstances = 0;
+	
     #endregion
-	// ADDED:
-	// this fixes the resetting of the pipePrintToConsoleStatic bug:
-	// resetting at runtime
+    // Editor-only initialization to set static field before Play Mode
 #if UNITY_EDITOR
     [InitializeOnLoad]
     private static class EditorInitializer
@@ -479,18 +482,17 @@ public class LibPdInstance : MonoBehaviour
                 if (instances.Length > 0)
                 {
                     pipePrintToConsoleStatic = instances[0].pipePrintToConsole;
-                    Debug.Log($"EditorInitializer: Set pipePrintToConsoleStatic to {pipePrintToConsoleStatic} from {instances[0].gameObject.name}");
+                    UnityEngine.Debug.Log($"EditorInitializer: Set pipePrintToConsoleStatic to {pipePrintToConsoleStatic} from {instances[0].gameObject.name}");
                 }
             }
             /*else if (state == PlayModeStateChange.EnteredEditMode)
             {
                 // Log to confirm state on stop
-                //Debug.Log("EditorInitializer EnteredEditMode: pipePrintToConsoleStatic = " + pipePrintToConsoleStatic);
+                //UnityEngine.Debug.Log("EditorInitializer EnteredEditMode: pipePrintToConsoleStatic = " + pipePrintToConsoleStatic);
             }*/
         }
     }
 #endif
-
     #region events
     //--------------------------------------------------------------------------
     /// Events placed in a struct so they don't clutter up the Inspector by default.
@@ -531,209 +533,189 @@ public class LibPdInstance : MonoBehaviour
 		public IntIntEvent MidiByte;
 	};
 	public MidiEvents midiEvents;
-	#endregion
+    #endregion
+
+    #region MonoBehaviour methods
+    //--------------------------------------------------------------------------
+    /// Initialise LibPd. 
 	
-	#region MonoBehaviour methods
-	//--------------------------------------------------------------------------
-	/// Initialise LibPd.
-	void Awake()
-	{
-		// ADDED 
-        // If this is the first instance and pdInitialised is false, sync the static variable
+	// MZ: awake now only subscribes to OnPatchBuild
+	// used to contain everything in the HandlePAtchSetup
+	private void Awake()
+    {
+        enabled = false;
+        patchBuilder = GetComponent<PatchingUtils.IPatchBuilder>();
+        if (patchBuilder != null)
+        {
+            patchBuilder.OnPatchBuilt += HandlePatchSetup;
+        }
+        else
+        {
+            UnityEngine.Debug.LogWarning($"{gameObject.name}: No IPatchBuilder found. Awaiting patch setup.");
+        }
+    }
+    
+
+    // MZ: this used to be the Awake, changed to a delegate to be invoked by the patchIsReady event
+    // called when the patch has been built
+    void HandlePatchSetup()
+    {
+        pipePrintToConsoleStatic = pipePrintToConsole;
         if (!pdInitialised)
         {
-            pipePrintToConsoleStatic = pipePrintToConsole;
-            //Debug.Log($"{gameObject.name} Awake: Synced pipePrintToConsoleStatic to {pipePrintToConsoleStatic}");
+            int initErr = libpd_queued_init();
+            if (initErr != 0)
+            {
+                UnityEngine.Debug.LogWarning("Warning; libpd_init() returned " + initErr);
+                UnityEngine.Debug.LogWarning("(Editor repeat runs are expected to return non-zero; not a problem)");
+            }
+
+            printHook = new LibPdPrintHook(PrintOutput);
+            libpd_set_queued_printhook(printHook);
+            bangHook = new LibPdBangHook(BangOutput);
+            libpd_set_queued_banghook(bangHook);
+            floatHook = new LibPdFloatHook(FloatOutput);
+            libpd_set_queued_floathook(floatHook);
+            symbolHook = new LibPdSymbolHook(SymbolOutput);
+            libpd_set_queued_symbolhook(symbolHook);
+            listHook = new LibPdListHook(ListOutput);
+            libpd_set_queued_listhook(listHook);
+            messageHook = new LibPdMessageHook(MessageOutput);
+            libpd_set_queued_messagehook(messageHook);
+            noteOnHook = new LibPdMidiNoteOnHook(MidiNoteOnOutput);
+            libpd_set_queued_noteonhook(noteOnHook);
+            controlChangeHook = new LibPdMidiControlChangeHook(MidiControlChangeOutput);
+            libpd_set_queued_controlchangehook(controlChangeHook);
+            programChangeHook = new LibPdMidiProgramChangeHook(MidiProgramChangeOutput);
+            libpd_set_queued_programchangehook(programChangeHook);
+            pitchBendHook = new LibPdMidiPitchBendHook(MidiPitchBendOutput);
+            libpd_set_queued_pitchbendhook(pitchBendHook);
+            aftertouchHook = new LibPdMidiAftertouchHook(MidiAftertouchOutput);
+            libpd_set_queued_aftertouchhook(aftertouchHook);
+            polyAftertouchHook = new LibPdMidiPolyAftertouchHook(MidiPolyAftertouchOutput);
+            libpd_set_queued_polyaftertouchhook(polyAftertouchHook);
+            midiByteHook = new LibPdMidiByteHook(MidiByteOutput);
+            libpd_set_queued_midibytehook(midiByteHook);
+
+            pdInitialised = true;
+
+            if (!string.IsNullOrEmpty(patchDir))
+                libpd_add_to_search_path(Application.streamingAssetsPath + patchDir);
         }
-        //Initialise libpd if possible, report any errors.
-        int initErr = libpd_queued_init();
-		if (initErr != 0)
-		{
-			Debug.LogWarning("Warning; libpd_init() returned " + initErr);
-			Debug.LogWarning("(if you're running this in the editor that probably just means this isn't the first time you've run your game, and is not a problem)");
-		}
 
-		//Initialise libpd, if it's not already.
-		if (!pdInitialised)
-		{
-			//Setup hooks.
-			printHook = new LibPdPrintHook(PrintOutput);
-			libpd_set_queued_printhook(printHook);
-			
-			bangHook = new LibPdBangHook(BangOutput);
-			libpd_set_queued_banghook(bangHook);
-			
-			floatHook = new LibPdFloatHook(FloatOutput);
-			libpd_set_queued_floathook(floatHook);
-			
-			symbolHook = new LibPdSymbolHook(SymbolOutput);
-			libpd_set_queued_symbolhook(symbolHook);
-			
-			listHook = new LibPdListHook(ListOutput);
-			libpd_set_queued_listhook(listHook);
-			
-			messageHook = new LibPdMessageHook(MessageOutput);
-			libpd_set_queued_messagehook(messageHook);
-			
-			noteOnHook = new LibPdMidiNoteOnHook(MidiNoteOnOutput);
-			libpd_set_queued_noteonhook(noteOnHook);
+        int bufferSize;
+        int noOfBuffers;
+        AudioSettings.GetDSPBufferSize(out bufferSize, out noOfBuffers);
+        numTicks = bufferSize / libpd_blocksize();
 
-			controlChangeHook = new LibPdMidiControlChangeHook(MidiControlChangeOutput);
-			libpd_set_queued_controlchangehook(controlChangeHook);
+        instance = libpd_new_instance();
+        libpd_set_instance(instance);
 
-			programChangeHook = new LibPdMidiProgramChangeHook(MidiProgramChangeOutput);
-			libpd_set_queued_programchangehook(programChangeHook);
+        int requestedNumSpeakers = GetNumSpeakers(AudioSettings.speakerMode);
+        int availableNumSpeakers = GetNumSpeakers(AudioSettings.driverCapabilities);
+        if (requestedNumSpeakers > availableNumSpeakers)
+        {
+            UnityEngine.Debug.LogWarning($"LibPdInstance Warning: Soundcard does not support {AudioSettings.speakerMode}. Using {AudioSettings.driverCapabilities} instead.");
+            requestedNumSpeakers = availableNumSpeakers;
+        }
 
-			pitchBendHook = new LibPdMidiPitchBendHook(MidiPitchBendOutput);
-			libpd_set_queued_pitchbendhook(pitchBendHook);
+        int err = libpd_init_audio(requestedNumSpeakers, requestedNumSpeakers, AudioSettings.outputSampleRate);
+        if (err != 0)
+        {
+            pdFail = true;
+            UnityEngine.Debug.LogError($"{gameObject.name}: Could not initialise Pure Data audio. Error = {err}");
+            return;
+        }
 
-			aftertouchHook = new LibPdMidiAftertouchHook(MidiAftertouchOutput);
-			libpd_set_queued_aftertouchhook(aftertouchHook);
+        if (string.IsNullOrEmpty(patchName))
+        {
+            UnityEngine.Debug.LogError($"{gameObject.name}: No patch assigned.");
+            patchFail = true;
+            return;
+        }
 
-			polyAftertouchHook = new LibPdMidiPolyAftertouchHook(MidiPolyAftertouchOutput);
-			libpd_set_queued_polyaftertouchhook(polyAftertouchHook);
+        bindings = new Dictionary<string, IntPtr>();
+        string fullPatchPath = Application.streamingAssetsPath + patchDir + patchName + ".pd";
+        //UnityEngine.Debug.Log($"{gameObject.name}: Attempting to open patch: {fullPatchPath}");
+        patchPointer = libpd_openfile(patchName + ".pd", Application.streamingAssetsPath + patchDir);
+        if (patchPointer == IntPtr.Zero)
+        {
+            UnityEngine.Debug.LogError($"{gameObject.name}: Could not open patch. Directory: {Application.streamingAssetsPath + patchDir} Patch: {patchName + ".pd"}");
+            patchFail = true;
+            return;
+        }
 
-			midiByteHook = new LibPdMidiByteHook(MidiByteOutput);
-			libpd_set_queued_midibytehook(midiByteHook);
+        libpd_start_message(1);
+        libpd_add_float(1.0f);
+        libpd_finish_message("pd", "dsp");
 
-			pdInitialised = true;
-			
-			//Try and add the patch directory to libpd's search path for
-			//loading externals (still can't seem to load externals when
-			//running in Unity though).
-			if(patchDir != String.Empty)
-				libpd_add_to_search_path(Application.streamingAssetsPath + patchDir);
+        if (!patchFail && !pdFail)
+        {
+            loaded = true;
+            ++numInstances;
+            if (!activeInstances.Contains(this))
+            {
+                activeInstances.Add(this);
+            }
+            enabled = true;
+            //UnityEngine.Debug.Log($"{gameObject.name}: HandlePatchSetup completed, loaded = {loaded}, enabled = {enabled}, activeInstances.Count = {activeInstances.Count}");
+        }
+    }
 
-			//Make sure our static pipePrintToConsole variable is set
-			//correctly.
-			pipePrintToConsoleStatic = pipePrintToConsole;
-		}
-		// DELETED
-		//else
-		//	pipePrintToConsole = pipePrintToConsoleStatic;
-
-		//Calc numTicks.
-		int bufferSize;
-		int noOfBuffers;
-
-		AudioSettings.GetDSPBufferSize(out bufferSize, out noOfBuffers);
-		numTicks = bufferSize/libpd_blocksize();
-
-		//Create our instance.
-		instance = libpd_new_instance();
-
-		//Set our instance.
-		libpd_set_instance(instance);
-
-		//Initialise audio.
-		int requestedNumSpeakers = GetNumSpeakers(AudioSettings.speakerMode);
-		int availableNumSpeakers = GetNumSpeakers(AudioSettings.driverCapabilities);
-
-		if(requestedNumSpeakers > availableNumSpeakers)
-		{
-			Debug.LogWarning("LibPdInstance Warning: Soundcard does not support speaker mode: " + AudioSettings.speakerMode + " Using mode: " + AudioSettings.driverCapabilities + " instead.");		
-
-			requestedNumSpeakers = availableNumSpeakers;
-		}
-
-		int err = libpd_init_audio(requestedNumSpeakers,
-								   requestedNumSpeakers,
-								   AudioSettings.outputSampleRate);
-		if(err != 0)
-		{
-			pdFail = true;
-			Debug.LogError(gameObject.name + ": Could not initialise Pure Data audio. Error = " + err);
-		}
-		else
-		{
-			if(patchName == String.Empty)
-			{
-				Debug.LogError(gameObject.name + ": No patch was assigned to this LibPdInstance.");
-				patchFail = true;
-			}
-			else
-			{
-				//Create our bindings dictionary.
-				bindings = new Dictionary<string, IntPtr>();
-
-				//Open our patch.
-				patchPointer = libpd_openfile(patchName + ".pd",
-											  Application.streamingAssetsPath + patchDir);
-				if(patchPointer == IntPtr.Zero)
-				{
-					Debug.LogError(gameObject.name +
-								   ": Could not open patch. Directory: " +
-								   Application.streamingAssetsPath + patchDir +
-								   " Patch: " + patchName + ".pd");
-					patchFail = true;
-				}
-
-				//Turn on audio processing.
-				libpd_start_message(1);
-				libpd_add_float(1.0f);
-				libpd_finish_message("pd", "dsp");
-
-				if(!patchFail)
-				{
-					loaded = true;
-					++numInstances;
-				}
-			}
-		}
-	}
-
-	//--------------------------------------------------------------------------
-	///	We only add ourselves to activeInstances when we're enabled.
-	void OnEnable()
+    //--------------------------------------------------------------------------
+    ///	We only add ourselves to activeInstances when we're enabled.
+    void OnEnable()
 	{
-		if(!pdFail && !patchFail && loaded)
-			activeInstances.Add(this);
-	}
+        //UnityEngine.Debug.Log($"{gameObject.name}: OnEnable called, loaded = {loaded}, activeInstances.Count = {activeInstances.Count}");
+    }
 
 	//--------------------------------------------------------------------------
 	///	Remove ourselves from activeInstances if we're disabled.
 	void OnDisable()
 	{
-		activeInstances.Remove(this);
-	}
+        //UnityEngine.Debug.Log($"{gameObject.name}: OnDisable called");
+        activeInstances.Remove(this);
+    }
 
 	//--------------------------------------------------------------------------
 	/// Close the patch file on quit.
 	void OnDestroy()
 	{
-		if(!pdFail && !patchFail && loaded)
-		{
-			libpd_set_instance(instance);
+        // MZ: Clean up subscription
+        // Unsubscribe from the event if subscribed
+        if (patchBuilder != null)
+        {
+            patchBuilder.OnPatchBuilt -= HandlePatchSetup;
+        }
 
-			libpd_start_message(1);
-			libpd_add_float(0.0f);
-			libpd_finish_message("pd", "dsp");
+        if (!pdFail && !patchFail && loaded)
+        {
+            libpd_set_instance(instance);
+            libpd_start_message(1);
+            libpd_add_float(0.0f);
+            libpd_finish_message("pd", "dsp");
 
-			foreach(var ptr in bindings.Values)
-				libpd_unbind(ptr);
-			bindings.Clear();
+            foreach (var ptr in bindings.Values)
+                libpd_unbind(ptr);
+            bindings.Clear();
 
-			libpd_closefile(patchPointer);
+            libpd_closefile(patchPointer);
+            libpd_free_instance(instance);
+        }
 
-			libpd_free_instance(instance);
-		}
+        --numInstances;
 
-		--numInstances;
-
-		//If we're the last instance left, release libpd's ringbuffer.
-		if(pdInitialised && (numInstances < 1))
-		{
-			if(printHook != null)
-			{
-				printHook = null;
-				libpd_set_queued_printhook(printHook);
-			}
-
-			libpd_queued_release();
-
-			pdInitialised = false;
-		}
-	}
+        if (pdInitialised && numInstances < 1)
+        {
+            if (printHook != null)
+            {
+                printHook = null;
+                libpd_set_queued_printhook(printHook);
+            }
+            libpd_queued_release();
+            pdInitialised = false;
+        }
+    }
 	
 	//--------------------------------------------------------------------------
 	/// We use this to dispatch any events that we've been sent from libpd.
@@ -742,58 +724,51 @@ public class LibPdInstance : MonoBehaviour
 	/// will get very upset.
 	public void Update()
 	{
-		//Receive any queued messages.
-		/*!
+        //if(Application.isPlaying)
+        //UnityEngine.Debug.Log($"{gameObject.name} Update: pipePrintToConsole = {pipePrintToConsole}, pipePrintToConsoleStatic = {pipePrintToConsoleStatic}");
+        //Receive any queued messages.
+        /*!
 			We use this slightly hacky if statement to ensure we only receive
 			messages once per frame.
 		 */
-		if(this == activeInstances[0])
+
+        // MZ: added loaded check to wait for the patch builing to complete
+        // Robust check: only proceed if loaded and there’s at least one active instance
+        if (!loaded || activeInstances.Count == 0)
+        {
+            UnityEngine.Debug.Log($"{gameObject.name}: Update skipped, loaded = {loaded}, activeInstances.Count = {activeInstances.Count}");
+            return;
+        }
+        if (this == activeInstances[0])
 		{
 			libpd_queued_receive_pd_messages();
 			libpd_queued_receive_midi_messages();
 		}
-	}
+
 	
-	//--------------------------------------------------------------------------
-	/// This function updates our static pipePrintToConsole variable when the
-	/// public one changes, and ensures all other active LibPdInstances are
-	/// updated too.
-	private void OnValidate()
-	{
-        // DELETED
-        //if(pipePrintToConsoleStatic != pipePrintToConsole)
-        //{
-        //	pipePrintToConsoleStatic = pipePrintToConsole;
+	}
 
-        //	LibPdInstance[] activePatches = FindObjectsOfType<LibPdInstance>();
 
-        //	for(int i=0;i<activePatches.Length;++i)
-        //		activePatches[i].pipePrintToConsole = pipePrintToConsoleStatic;
-        //}
-
-		// MODIFIED
+    //--------------------------------------------------------------------------
+    /// This function updates our static pipePrintToConsole variable when the
+    /// public one changes, and ensures all other active LibPdInstances are
+    /// updated too.
 #if UNITY_EDITOR
-        if (!EditorApplication.isPlaying) // Only sync in Edit Mode
+    private void OnValidate()
+	{
+        if (!EditorApplication.isPlaying && patch != null)
         {
             string lastName = patchName;
-
-            if (patch != null)
-                patchName = patch.name;
-
-            if ((lastName != patchName) ||
-                ((patch != null) && (patchDir == null)) ||
-                ((patch != null) && (patchDir != null) && (patchDir.IndexOf("StreamingAssets") != -1)))
+            patchName = patch.name;
+            if ((lastName != patchName) || string.IsNullOrEmpty(patchDir) || patchDir.Contains("StreamingAssets"))
             {
                 patchDir = AssetDatabase.GetAssetPath(patch.GetInstanceID());
                 patchDir = patchDir.Substring(patchDir.IndexOf("Assets/StreamingAssets") + 22);
                 patchDir = patchDir.Substring(0, patchDir.LastIndexOf('/') + 1);
             }
         }
-
-		
-#endif
     }
-
+#endif
     //--------------------------------------------------------------------------
     /// Process audio.
     void OnAudioFilterRead(float[] data, int channels)
@@ -808,15 +783,19 @@ public class LibPdInstance : MonoBehaviour
 
 	#region public methods
 	//--------------------------------------------------------------------------
-	///	Returns the dollar-zero ID for the patch instance.
+	///	Returns the dollar-zero ID for the patch instance. <summary>
+	//
+	/// </summary>
+	/// <returns></returns>
 	public int GetDollarZero()
 	{
 		return libpd_getdollarzero(patchPointer);
 	}
+    
 
-	//--------------------------------------------------------------------------
-	/// Bind to a named object in the patch.
-	[MethodImpl(MethodImplOptions.Synchronized)]
+    //--------------------------------------------------------------------------
+    /// Bind to a named object in the patch.
+    [MethodImpl(MethodImplOptions.Synchronized)]
 	public void Bind(string symbol)
 	{
 		libpd_set_instance(instance);
@@ -849,8 +828,9 @@ public class LibPdInstance : MonoBehaviour
 		int err = libpd_bang(receiver);
 	
 		if(err == -1)
-			Debug.LogWarning(gameObject.name + "::SendBang(): Could not find " + receiver + " object.");
+			UnityEngine.Debug.LogWarning(gameObject.name + "::SendBang(): Could not find " + receiver + " object.");
 	}
+	
 
 	//--------------------------------------------------------------------------
 	/// Send a float to the named receive object.
@@ -862,7 +842,7 @@ public class LibPdInstance : MonoBehaviour
 		int err = libpd_float(receiver, val);
 	
 		if(err == -1)
-			Debug.LogWarning(gameObject.name + "::SendFloat(): Could not find " + receiver + " object.");
+			UnityEngine.Debug.LogWarning(gameObject.name + "::SendFloat(): Could not find " + receiver + " object.");
 	}
 
 	//--------------------------------------------------------------------------
@@ -873,7 +853,7 @@ public class LibPdInstance : MonoBehaviour
 		libpd_set_instance(instance);
 	
 		if(libpd_symbol(receiver, symbol) != 0)
-			Debug.LogWarning(gameObject.name + "::SendSymbol(): Could not find " + receiver + " object.");
+			UnityEngine.Debug.LogWarning(gameObject.name + "::SendSymbol(): Could not find " + receiver + " object.");
 	}
 
 	//--------------------------------------------------------------------------
@@ -881,34 +861,33 @@ public class LibPdInstance : MonoBehaviour
 	[MethodImpl(MethodImplOptions.Synchronized)]
 	public void SendList(string receiver, params object[] args)
 	{
-		// ADDED:
-		// fixes the sendlist bug
-		libpd_set_instance(instance);
-		ProcessArgs(args);
+        libpd_set_instance(instance);
+
+        ProcessArgs(args);
 
 		if(libpd_finish_list(receiver) != 0)
-			Debug.LogWarning(gameObject.name + "::SendList(): Could not send list. receiver = " + receiver);
+			UnityEngine.Debug.LogWarning(gameObject.name + "::SendList(): Could not send list. receiver = " + receiver);
 	}
-
-	//--------------------------------------------------------------------------
-	///	Send a message to the named receive object.
-	///	<param name="destination">The name of the object to send the message
-	///	 to.</param>
-	///	<param name="symbol">The message keyword.</param>
-	///	<param name="args">A list of values to send to the named object.</param>
-	[MethodImpl(MethodImplOptions.Synchronized)]
+    
+    //--------------------------------------------------------------------------
+    ///	Send a message to the named receive object.
+    ///	<param name="destination">The name of the object to send the message
+    ///	 to.</param>
+    ///	<param name="symbol">The message keyword.</param>
+    ///	<param name="args">A list of values to send to the named object.</param>
+    [MethodImpl(MethodImplOptions.Synchronized)]
 	public void SendMessage(string destination,
 							string symbol,
 							params object[] args)
 	{
-        // ADDED:
-        // fixes the sendMessage bug
         libpd_set_instance(instance);
-		ProcessArgs(args);
+        ProcessArgs(args);
 
 		if(libpd_finish_message(destination, symbol) != 0)
-			Debug.LogWarning(gameObject.name + "::SendMessage(): Could not send message. destination = " + destination + " symbol = " + symbol);
+			UnityEngine.Debug.LogWarning(gameObject.name + "::SendMessage(): Could not send message. destination = " + destination + " symbol = " + symbol);
 	}
+
+	
 
 	//--------------------------------------------------------------------------
 	/// Send a MIDI note to the open patch.
@@ -920,35 +899,63 @@ public class LibPdInstance : MonoBehaviour
 	[MethodImpl(MethodImplOptions.Synchronized)]
 	public void SendMidiNoteOn(int channel, int pitch, int velocity)
 	{
-		libpd_set_instance(instance);
-		
-		if(libpd_noteon(channel, pitch, velocity) != 0)
-			Debug.LogWarning(gameObject.name + "::SendMidiNoteOn(): input parameter(s) out of range. channel = " + channel + " pitch = " + pitch + " velocity = " + velocity);
-	}
+        // Check if instance is initialized and patch is loaded
+        if (!loaded || instance == IntPtr.Zero || pdFail || patchFail)
+        {
+            UnityEngine.Debug.LogWarning($"{gameObject.name}::SendMidiNoteOn(): Cannot send MIDI Note On; libpd instance not ready or patch failed to load. channel = {channel}, pitch = {pitch}, velocity = {velocity}. Stack: {new StackTrace(true)}");
+            return;
+        }
 
-	//--------------------------------------------------------------------------
-	/// Send a MIDI control change to the open patch.
-	/// <param name="controller">The controller number (0-127).</param>
-	/// <param name="value">The controller value (0-127).</param>
-	[MethodImpl(MethodImplOptions.Synchronized)]
-	public void SendMidiCc(int channel, int controller, int value)
-	{
-		libpd_set_instance(instance);
+        // Validate parameters
+        if (channel < 0 || channel > 15 || pitch < 0 || pitch > 127 || velocity < 0 || velocity > 127)
+        {
+            UnityEngine.Debug.LogWarning($"{gameObject.name}::SendMidiNoteOn(): Invalid parameter(s). channel = {channel}, pitch = {pitch}, velocity = {velocity}. Expected: channel [0-15], pitch [0-127], velocity [0-127]. Stack: {new StackTrace(true)}");
+            return;
+        }
 
-		if(libpd_controlchange(channel, controller, value) != 0)
-			Debug.LogWarning(gameObject.name + "::SendMidiCc(): input parameter(s) out of range. channel = " + channel + " controller = " + controller + " value = " + value);
-	}
+        libpd_set_instance(instance);
 
-	//--------------------------------------------------------------------------
-	/// Send a MIDI program change to the open patch.
-	/// <param name="value">The program to change to (0-127).</param>
-	[MethodImpl(MethodImplOptions.Synchronized)]
+        if (libpd_noteon(channel, pitch, velocity) != 0)
+            UnityEngine.Debug.LogWarning($"{gameObject.name}::SendMidiNoteOn(): libpd_noteon failed. channel = {channel}, pitch = {pitch}, velocity = {velocity}");
+
+    }
+
+    //--------------------------------------------------------------------------
+    /// Send a MIDI control change to the open patch.
+    /// <param name="controller">The controller number (0-127).</param>
+    /// <param name="value">The controller value (0-127).</param>
+    [MethodImpl(MethodImplOptions.Synchronized)]
+    public void SendMidiCc(int channel, int controller, int value)
+    {
+        // Check if instance is initialized and patch is loaded
+        if (!loaded || instance == IntPtr.Zero || pdFail || patchFail)
+        {
+            UnityEngine.Debug.LogWarning($"{gameObject.name}::SendMidiCc(): Cannot send MIDI CC; libpd instance not ready or patch failed to load. channel = {channel}, controller = {controller}, value = {value}. Stack: {new System.Diagnostics.StackTrace(true)}");
+            return;
+        }
+
+        // Validate parameters to prevent invalid values
+        if (channel < 0 || channel > 15 || controller < 0 || controller > 127 || value < 0 || value > 127)
+        {
+            UnityEngine.Debug.LogWarning($"{gameObject.name}::SendMidiCc(): Invalid parameter(s). channel = {channel}, controller = {controller}, value = {value}. Expected: channel [0-15], controller [0-127], value [0-127]. Stack: {new System.Diagnostics.StackTrace(true)}");
+            return;
+        }
+
+        libpd_set_instance(instance);
+
+        if (libpd_controlchange(channel, controller, value) != 0)
+            UnityEngine.Debug.LogWarning($"{gameObject.name}::SendMidiCc(): libpd_controlchange failed. channel = {channel}, controller = {controller}, value = {value}");
+    }
+    //--------------------------------------------------------------------------
+    /// Send a MIDI program change to the open patch.
+    /// <param name="value">The program to change to (0-127).</param>
+    [MethodImpl(MethodImplOptions.Synchronized)]
 	public void SendMidiProgramChange(int channel, int value)
 	{
 		libpd_set_instance(instance);
 
 		if(libpd_programchange(channel, value) != 0)
-			Debug.LogWarning(gameObject.name + "::SendMidiProgramChange(): input parameter(s) out of range. channel = " + channel + " value = " + value);
+			UnityEngine.Debug.LogWarning(gameObject.name + "::SendMidiProgramChange(): input parameter(s) out of range. channel = " + channel + " value = " + value);
 	}
 
 	//--------------------------------------------------------------------------
@@ -960,7 +967,7 @@ public class LibPdInstance : MonoBehaviour
 		libpd_set_instance(instance);
 
 		if(libpd_pitchbend(channel, value) != 0)
-			Debug.LogWarning(gameObject.name + "::SendMidPitchBend(): input parameter(s) out of range. channel = " + channel + " value = " + value);
+			UnityEngine.Debug.LogWarning(gameObject.name + "::SendMidPitchBend(): input parameter(s) out of range. channel = " + channel + " value = " + value);
 	}
 
 	//--------------------------------------------------------------------------
@@ -971,7 +978,7 @@ public class LibPdInstance : MonoBehaviour
 		libpd_set_instance(instance);
 
 		if(libpd_aftertouch(channel, value) != 0)
-			Debug.LogWarning(gameObject.name + "::SendMidiAftertouch(): input parameter(s) out of range. channel = " + channel + " value = " + value);
+			UnityEngine.Debug.LogWarning(gameObject.name + "::SendMidiAftertouch(): input parameter(s) out of range. channel = " + channel + " value = " + value);
 	}
 
 	//--------------------------------------------------------------------------
@@ -982,7 +989,7 @@ public class LibPdInstance : MonoBehaviour
 		libpd_set_instance(instance);
 
 		if(libpd_polyaftertouch(channel, pitch, value) != 0)
-			Debug.LogWarning(gameObject.name + "::SendMidiPolyAftertouch(): input parameter(s) out of range. channel = " + channel + " pitch = " + pitch + " value = " + value);
+			UnityEngine.Debug.LogWarning(gameObject.name + "::SendMidiPolyAftertouch(): input parameter(s) out of range. channel = " + channel + " pitch = " + pitch + " value = " + value);
 	}
 
 	//--------------------------------------------------------------------------
@@ -993,7 +1000,7 @@ public class LibPdInstance : MonoBehaviour
 		libpd_set_instance(instance);
 
 		if(libpd_midibyte(port, value) != 0)
-			Debug.LogWarning(gameObject.name + "::SendMidiByte(): input parameter(s) out of range. port = " + port + " value = " + value);
+			UnityEngine.Debug.LogWarning(gameObject.name + "::SendMidiByte(): input parameter(s) out of range. port = " + port + " value = " + value);
 	}
 
 	//--------------------------------------------------------------------------
@@ -1004,7 +1011,7 @@ public class LibPdInstance : MonoBehaviour
 		libpd_set_instance(instance);
 
 		if(libpd_sysex(port, value) != 0)
-			Debug.LogWarning(gameObject.name + "::SendMidSysex(): input parameter(s) out of range. port = " + port + " value = " + value);
+			UnityEngine.Debug.LogWarning(gameObject.name + "::SendMidSysex(): input parameter(s) out of range. port = " + port + " value = " + value);
 	}
 
 	//--------------------------------------------------------------------------
@@ -1015,7 +1022,7 @@ public class LibPdInstance : MonoBehaviour
 		libpd_set_instance(instance);
 
 		if(libpd_sysrealtime(port, value) != 0)
-			Debug.LogWarning(gameObject.name + "::SendMidiSysRealtime(): input parameter(s) out of range. port = " + port + " value = " + value);
+			UnityEngine.Debug.LogWarning(gameObject.name + "::SendMidiSysRealtime(): input parameter(s) out of range. port = " + port + " value = " + value);
 	}
 
 	//--------------------------------------------------------------------------
@@ -1045,10 +1052,10 @@ public class LibPdInstance : MonoBehaviour
 		//Note: the wiki says libpd_read_array() is supposed to return an error
 		//code if the array doesn't exist or [offset -> offset+n] lies outside
 		//the array, but looking at the code in z_libpd.c it will always return
-		//0 (success). In case that ever changes we write any errors to Debug,
+		//0 (success). In case that ever changes we write any errors to UnityEngine.Debug,
 		//but for the time being our error checking code is extraneous.
 		if(libpd_read_array(dest, src, offset, count) < 0)
-			Debug.LogWarning(gameObject.name + "::ReadArray(): Array [" + src + "] does not exist OR the desired range lies outside the array's range.");
+			UnityEngine.Debug.LogWarning(gameObject.name + "::ReadArray(): Array [" + src + "] does not exist OR the desired range lies outside the array's range.");
 	}
 
 	//--------------------------------------------------------------------------
@@ -1066,7 +1073,7 @@ public class LibPdInstance : MonoBehaviour
 
 		//The same note (ReadArray) re: return values applies here.
 		if(libpd_write_array(dest, offset, src, count) < 0)
-			Debug.LogWarning(gameObject.name + "::WriteArray(): Array [" + dest + "] does not exist OR the desired range lies outside the array's range.");
+			UnityEngine.Debug.LogWarning(gameObject.name + "::WriteArray(): Array [" + dest + "] does not exist OR the desired range lies outside the array's range.");
 	}
 	#endregion
 
@@ -1076,8 +1083,8 @@ public class LibPdInstance : MonoBehaviour
 	[MonoPInvokeCallback(typeof(LibPdPrintHook))]
 	private static void PrintOutput(string message)
 	{
-		if(pipePrintToConsoleStatic)
-			Debug.Log("libpd: " + message);
+		if (pipePrintToConsoleStatic)
+			UnityEngine.Debug.Log("libpd: " + message);
 	}
 
 	//--------------------------------------------------------------------------
@@ -1199,11 +1206,11 @@ public class LibPdInstance : MonoBehaviour
 	private void ProcessArgs(object[] args)
 	{
 		if(args.Length < 1)
-			Debug.LogWarning(gameObject.name + "::ProcessArgs(): no arguments passed in for list or message.");
+			UnityEngine.Debug.LogWarning(gameObject.name + "::ProcessArgs(): no arguments passed in for list or message.");
 		else
 		{
 			if(libpd_start_message(args.Length) != 0)
-				Debug.LogWarning(gameObject.name + "::ProcessArgs(): Could not allocate memory for list or message.");
+				UnityEngine.Debug.LogWarning(gameObject.name + "::ProcessArgs(): Could not allocate memory for list or message.");
 			else
 			{
 				foreach(object arg in args)
@@ -1217,7 +1224,7 @@ public class LibPdInstance : MonoBehaviour
 					else if(arg is string)
 						libpd_add_symbol((string)arg);
 					else
-						Debug.LogWarning(gameObject.name + "::ProcessArgs(): Cannot process argument of type " + arg.GetType() + " for list or message.");
+						UnityEngine.Debug.LogWarning(gameObject.name + "::ProcessArgs(): Cannot process argument of type " + arg.GetType() + " for list or message.");
 				}
 			}
 		}
